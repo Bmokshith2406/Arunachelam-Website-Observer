@@ -32,202 +32,260 @@ Alert deduplication works as follows:
 - A fully closed state resets the key; the same dates reopening later trigger a
   new burst.
 
-## Deploy entirely from Chrome and Google Cloud Console
+## Deploy from GitHub using local PowerShell
 
-You do not need Docker or the Google Cloud CLI on your computer. Cloud Shell runs
-inside Google Cloud Console, and Cloud Build builds the container from this
-repository's `Dockerfile`.
+This is the primary deployment path. GitHub stores the code, while your local
+PowerShell terminal configures Google Cloud and deploys the service. You do not
+need to use Google Cloud Console or build a Docker image locally; Cloud Build
+builds the repository's `Dockerfile` when `gcloud run deploy --source .` runs.
 
-Before beginning, have these ready:
+You need:
 
+- Git for Windows
+- Google Cloud CLI
 - a Google Cloud project with billing enabled
-- the project's **Project ID** (not its display name or project number)
-- the Gmail address that will send alerts
-- the email address that will receive alerts
-- a Gmail app password created in the next step
+- permission to manage APIs, IAM, Firestore, Secret Manager, and Cloud Run
+- a Gmail account with 2-Step Verification enabled
 
-The commands below are intended for **Cloud Shell's Bash terminal**, not Windows
-PowerShell, unless the step explicitly says otherwise.
+All commands below run in Windows PowerShell.
 
-### 1. Create the Gmail app password
+### 1. Install and authenticate the Google Cloud CLI
 
-1. Sign in to the Google account that will send the alerts.
-2. Turn on **2-Step Verification**.
-3. Open [Google App passwords](https://myaccount.google.com/apppasswords).
-4. Create an app password named `Arunachalam monitor`.
-5. Copy the 16-character password. Remove the display spaces when storing it.
-
-Do not put this password in the source ZIP or in a normal Cloud Run environment
-variable. Google may revoke app passwords after the Google account password is
-changed. Personal Gmail also has sending limits, so avoid repeatedly triggering
-production test alerts; every new availability state sends ten messages.
-
-### 2. Create the source ZIP on Windows
-
-Open PowerShell in `D:\Arunachalam-Web-Observability` and run:
+Install the [Google Cloud CLI for Windows](https://docs.cloud.google.com/sdk/docs/install-sdk#windows),
+open a new PowerShell window, and run:
 
 ```powershell
-$deployFiles = @("app", "requirements.txt", "Dockerfile", ".dockerignore", "pytest.ini", "README.md")
-Compress-Archive -Path $deployFiles -DestinationPath "arunachalam-monitor-source.zip" -Force
+gcloud init
+gcloud auth list
 ```
 
-This deliberately excludes `.venv`, `.git`, test caches, local `.env` files, and
-credentials. The resulting file is
-`D:\Arunachalam-Web-Observability\arunachalam-monitor-source.zip`.
+`gcloud init` opens a normal Google sign-in page for authentication; it does not
+require you to configure the service through Google Cloud Console.
 
-### 3. Open the project and enable Google APIs
+If you do not already have a project, it can also be created and linked to an
+existing billing account from the terminal:
 
-1. Open [Google Cloud Console](https://console.cloud.google.com/) in Chrome.
-2. Use the project selector at the top to select the project with billing enabled.
-3. Click **Activate Cloud Shell** (`>_`) in the top-right corner.
-4. In Cloud Shell, replace the first value below and run all the commands:
+```powershell
+gcloud billing accounts list
+gcloud projects create "YOUR-GLOBALLY-UNIQUE-PROJECT-ID" --name="Arunachalam Monitor"
+gcloud billing projects link "YOUR-GLOBALLY-UNIQUE-PROJECT-ID" --billing-account="YOUR-BILLING-ACCOUNT-ID"
+```
 
-```bash
-PROJECT_ID="your-project-id"
-gcloud config set project "$PROJECT_ID"
-gcloud services enable \
-  run.googleapis.com \
-  cloudbuild.googleapis.com \
-  artifactregistry.googleapis.com \
-  firestore.googleapis.com \
+Skip those three commands when the project already exists and has billing.
+
+### 2. Clone the GitHub repository
+
+```powershell
+Set-Location "D:\"
+git clone https://github.com/Bmokshith2406/Arunachelam-Website-Observer.git
+Set-Location ".\Arunachelam-Website-Observer"
+```
+
+If you are already working in the cloned repository, use:
+
+```powershell
+git pull --ff-only origin main
+```
+
+Never create or commit a real `.env` file containing the Gmail app password.
+
+### 3. Select the project and enable APIs
+
+Replace the project ID, then run the entire block:
+
+```powershell
+$projectId = "YOUR-PROJECT-ID"
+gcloud config set project $projectId
+
+gcloud services enable `
+  run.googleapis.com `
+  cloudbuild.googleapis.com `
+  artifactregistry.googleapis.com `
+  firestore.googleapis.com `
   secretmanager.googleapis.com
 
-# Required by current Cloud Run source deployments so Cloud Build can build it.
-PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
-BUILD_SERVICE_ACCOUNT="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
-gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-  --member="serviceAccount:${BUILD_SERVICE_ACCOUNT}" \
+$projectNumber = gcloud projects describe $projectId --format="value(projectNumber)"
+$buildServiceAccount = "${projectNumber}-compute@developer.gserviceaccount.com"
+
+gcloud projects add-iam-policy-binding $projectId `
+  --member="serviceAccount:$buildServiceAccount" `
   --role="roles/run.builder"
 ```
 
-Wait until the commands finish, then allow a couple of minutes for the new build
-permission to propagate. The selected project shown in the Console header must be
-the same project printed by `gcloud config get-value project`.
+The final role allows the default Cloud Build identity to build source
+deployments. Allow a couple of minutes for a newly granted role to propagate.
 
-These steps assume you own the project. In an organization-managed project, an
-administrator may instead need to grant your Google account **Cloud Run Source
-Developer**, **Service Usage Consumer**, and **Service Account User**.
+These instructions assume you own the project. In an organization-managed
+project, an administrator may need to grant your Google account **Cloud Run
+Source Developer**, **Service Usage Consumer**, and **Service Account User**.
 
-### 4. Create Firestore in the Console
+### 4. Create Firestore from PowerShell
 
-Firestore stores only dates, fingerprints, timestamps, leases, failure counters,
-and alert keys. It stores no temple login, devotee details, OTP, CAPTCHA, card, or
-payment information.
+The app uses the `(default)` Firestore database in Mumbai. It stores only dates,
+response fingerprints, timestamps, leases, failure counters, and alert keys. It
+does not store devotee information, OTPs, CAPTCHA, cards, or payment details.
 
-1. Use the Console search bar to open **Firestore**.
-2. Open **Databases**, then click **Create database**.
-3. Select **Firestore Native mode** and the **Standard** edition if an edition is
-   requested.
-4. Leave the database ID as `(default)`; if the form shows an empty optional ID,
-   leave it empty so Standard edition creates `(default)`.
-5. Select `asia-south1 (Mumbai)` as the location.
-6. Choose production/locked security rules if prompted, then create the database.
-7. Enable delete protection if the Console offers that option.
+```powershell
+gcloud firestore databases describe --database="(default)" 1>$null 2>$null
 
-If `(default)` already exists, use it and do not create another database. A
-Firestore location cannot be changed after creation. Do not manually create a
-collection, document, or index; the service creates its state document during its
+if ($LASTEXITCODE -ne 0) {
+  gcloud firestore databases create `
+    --database="(default)" `
+    --location="asia-south1" `
+    --edition="standard" `
+    --type="firestore-native" `
+    --delete-protection
+}
+```
+
+If the database already exists, the block leaves it unchanged. A Firestore
+location cannot be changed after creation. No collection, document, or index
+needs to be created manually; the service creates its state document during its
 first successful transaction.
 
 ### 5. Create the runtime service account
 
-1. Use the Console search bar to open **Service Accounts**.
-2. Click **Create service account**.
-3. Enter `arunachalam-monitor` as the service account name and click **Create and
-   continue**.
-4. Grant the role **Cloud Datastore User**.
-5. Click **Done**. Do not create or download a JSON key.
-6. Copy the service account email. It will look like
-   `arunachalam-monitor@your-project-id.iam.gserviceaccount.com`.
+```powershell
+$serviceAccountName = "arunachalam-monitor"
+$serviceAccountEmail = "$serviceAccountName@$projectId.iam.gserviceaccount.com"
 
-The Cloud Datastore User role allows the server SDK to transact with Firestore.
-Firestore browser/mobile security rules do not replace this IAM permission.
+gcloud iam service-accounts describe $serviceAccountEmail 1>$null 2>$null
 
-### 6. Store the Gmail password in Secret Manager
+if ($LASTEXITCODE -ne 0) {
+  gcloud iam service-accounts create $serviceAccountName `
+    --display-name="Arunachalam ticket monitor"
+}
 
-1. Use the Console search bar to open **Secret Manager**.
-2. Click **Create secret**.
-3. Name it `arunachalam-gmail-app-password`.
-4. Paste the Gmail app password as the secret value, without spaces.
-5. Leave automatic replication selected and click **Create secret**.
-6. On the new secret's details page, open **Permissions** or **Show info panel**,
-   then click **Grant access**.
-7. Add the `arunachalam-monitor@...` service account as the principal.
-8. Assign **Secret Manager Secret Accessor** and save.
-
-Only the runtime service account should receive access to this secret.
-
-### 7. Upload and deploy from Cloud Shell
-
-1. Return to Cloud Shell.
-2. Open its three-dot **More** menu, select **Upload**, and upload
-   `arunachalam-monitor-source.zip`.
-3. Run:
-
-```bash
-DEPLOY_DIR="$HOME/arunachalam-monitor-$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$DEPLOY_DIR"
-unzip -q "$HOME/arunachalam-monitor-source.zip" -d "$DEPLOY_DIR"
-cd "$DEPLOY_DIR"
-
-PROJECT_ID="$(gcloud config get-value project)"
-SERVICE_ACCOUNT="arunachalam-monitor@${PROJECT_ID}.iam.gserviceaccount.com"
-ADMIN_API_KEY="$(openssl rand -hex 24)"
-
-SMTP_USERNAME="sender@gmail.com"
-ALERT_RECIPIENT="recipient@gmail.com"
-
-echo "Save this ADMIN_API_KEY somewhere private: ${ADMIN_API_KEY}"
+gcloud projects add-iam-policy-binding $projectId `
+  --member="serviceAccount:$serviceAccountEmail" `
+  --role="roles/datastore.user"
 ```
 
-Replace `sender@gmail.com` and `recipient@gmail.com` in Cloud Shell with the real
-addresses, rerun those two assignment lines, and save the printed admin API key.
-Then deploy:
+Do not create or download a service-account JSON key. Cloud Run uses the service
+account directly. `roles/datastore.user` gives the runtime access to Firestore.
 
-```bash
-gcloud run deploy arunachalam-ticket-monitor \
-  --source . \
-  --region asia-south1 \
-  --service-account "$SERVICE_ACCOUNT" \
-  --allow-unauthenticated \
-  --min 1 \
-  --max 1 \
-  --no-cpu-throttling \
-  --cpu 1 \
-  --memory 512Mi \
-  --concurrency 10 \
-  --timeout 60 \
-  --set-env-vars "^@^ENVIRONMENT=production@POLL_INTERVAL_SECONDS=20@FIRESTORE_PROJECT_ID=${PROJECT_ID}@FIRESTORE_DATABASE=(default)@SMTP_USERNAME=${SMTP_USERNAME}@SMTP_FROM_EMAIL=${SMTP_USERNAME}@ALERT_RECIPIENTS=[\"${ALERT_RECIPIENT}\"]@ADMIN_API_KEY=${ADMIN_API_KEY}" \
-  --set-secrets "SMTP_APP_PASSWORD=arunachalam-gmail-app-password:1"
+### 6. Create the Gmail app password and Secret Manager secret
+
+1. Enable 2-Step Verification on the Gmail sender account.
+2. Open [Google App passwords](https://myaccount.google.com/apppasswords).
+3. Create an app password named `Arunachalam monitor`.
+4. Keep the generated 16-character value ready and remove its display spaces.
+
+Create the secret if it does not already exist:
+
+```powershell
+$secretName = "arunachalam-gmail-app-password"
+
+gcloud secrets describe $secretName 1>$null 2>$null
+
+if ($LASTEXITCODE -ne 0) {
+  gcloud secrets create $secretName --replication-policy="automatic"
+}
 ```
 
-Answer `y` if Cloud Shell asks to create an Artifact Registry repository or
-enable another required API. When deployment completes, copy the service URL
-printed after `Service URL:`.
+Add the Gmail password without placing it in PowerShell history. The following
+block masks the input, writes a temporary file without a trailing newline,
+uploads it, and removes the file in `finally` even if the upload fails:
 
-These flags are essential for an all-day background monitor: minimum instances
-is `1`, maximum instances is `1`, and `--no-cpu-throttling` keeps CPU allocated
-between HTTP requests. This configuration incurs ongoing Cloud Run charges and
-Cloud Run can still occasionally restart the instance; Firestore preserves the
-monitor state and the application resumes automatically.
+```powershell
+$temporarySecretFile = New-TemporaryFile
+$temporarySecretPath = $temporarySecretFile.FullName
+$secureAppPassword = Read-Host "Paste the Gmail app password" -AsSecureString
+$temporaryCredential = [PSCredential]::new("gmail", $secureAppPassword)
 
-### 8. Verify the deployment in Chrome
+try {
+  $plainAppPassword = $temporaryCredential.GetNetworkCredential().Password
+  [IO.File]::WriteAllText($temporarySecretPath, $plainAppPassword)
+  gcloud secrets versions add $secretName --data-file=$temporarySecretPath
+}
+finally {
+  Remove-Item -LiteralPath $temporarySecretPath -Force -ErrorAction SilentlyContinue
+  Remove-Variable plainAppPassword -ErrorAction SilentlyContinue
+  $temporaryCredential = $null
+  $secureAppPassword = $null
+}
+```
 
-1. Open **Cloud Run** in the Console and select
-   `arunachalam-ticket-monitor`.
-2. Click its URL and append `/healthz/live`. The response should contain
-   `"status":"alive"`.
-3. Change the path to `/healthz/ready`. It should return HTTP 200 after startup.
-4. Change the path to `/docs` to open the interactive FastAPI documentation.
-5. In `/docs`, expand `GET /api/v1/monitor/status`, click **Try it out**, enter the
-   saved key in `X-API-Key`, and click **Execute**.
-6. To request one immediate check, do the same for
-   `POST /api/v1/monitor/check`. This does not bypass the Firestore deduplication
-   rules or deliberately send test emails.
-7. Return to the Cloud Run service and open **Logs**. Confirm that the monitor
-   started and availability checks are completing.
-8. Open **Firestore → Data**. After the first successful HR&CE response, the
-   `arunachalam_ticket_monitor` collection should appear automatically.
+Grant only the runtime service account permission to read it:
+
+```powershell
+gcloud secrets add-iam-policy-binding $secretName `
+  --member="serviceAccount:$serviceAccountEmail" `
+  --role="roles/secretmanager.secretAccessor"
+```
+
+The first secret version is version `1`. Check the active versions at any time:
+
+```powershell
+gcloud secrets versions list $secretName
+```
+
+### 7. Deploy to Cloud Run
+
+Generate a private management API key and save it in a password manager:
+
+```powershell
+$randomBytes = New-Object byte[] 24
+$randomGenerator = [Security.Cryptography.RandomNumberGenerator]::Create()
+$randomGenerator.GetBytes($randomBytes)
+$randomGenerator.Dispose()
+$adminApiKey = [BitConverter]::ToString($randomBytes).Replace("-", "").ToLowerInvariant()
+$adminApiKey
+```
+
+Deploy from the repository root after replacing the two email addresses:
+
+```powershell
+.\scripts\deploy_cloud_run.ps1 `
+  -ProjectId $projectId `
+  -ServiceAccountEmail $serviceAccountEmail `
+  -SmtpUsername "sender@gmail.com" `
+  -AlertRecipient "recipient@gmail.com" `
+  -AdminApiKey $adminApiKey
+```
+
+The deployment uses:
+
+- region `asia-south1` (Mumbai)
+- one minimum and one maximum instance
+- instance-based CPU allocation through `--no-cpu-throttling`
+- one vCPU and 512 MiB memory
+- a 20-second monitor interval
+- the Gmail password from Secret Manager version `1`
+
+Minimum instance `1` and instance-based CPU are required because the monitor runs
+between HTTP requests. This creates ongoing Cloud Run charges. Cloud Run can
+occasionally restart the instance, but Firestore preserves state and the monitor
+automatically resumes.
+
+### 8. Verify from PowerShell
+
+```powershell
+$serviceUrl = gcloud run services describe "arunachalam-ticket-monitor" `
+  --region="asia-south1" `
+  --format="value(status.url)"
+
+Invoke-RestMethod "$serviceUrl/healthz/live"
+Invoke-RestMethod "$serviceUrl/healthz/ready"
+Invoke-RestMethod "$serviceUrl/api/v1/monitor/status" `
+  -Headers @{ "X-API-Key" = $adminApiKey }
+```
+
+Request one immediate protected check with:
+
+```powershell
+Invoke-RestMethod "$serviceUrl/api/v1/monitor/check" `
+  -Method Post `
+  -Headers @{ "X-API-Key" = $adminApiKey }
+```
+
+View recent logs without opening Google Cloud Console:
+
+```powershell
+gcloud run services logs read "arunachalam-ticket-monitor" `
+  --region="asia-south1" `
+  --limit=100
+```
 
 No availability email is expected while all dates are closed. A temporary HR&CE
 timeout or invalid response is logged as a failure and does not stop the service,
@@ -235,25 +293,39 @@ erase the last successful state, or create a false “sold out” result. After 
 consecutive monitor failures, the service sends one warning email and keeps
 retrying.
 
-The useful Cloud Logging fields are `outcome`, `available_dates`, `source_url`,
-`consecutive_failures`, and the request trace ID. Prometheus-compatible process
-and HTTP metrics are available at `/metrics`.
+### 9. Deploy later GitHub updates
 
-### 9. Deploy a later code update
+Pull the new code and rerun the same deployment script:
 
-Recreate the ZIP with step 2, upload it to Cloud Shell again, unzip it with the
-same commands, restore the shell variables from step 7, and rerun the `gcloud run
-deploy` command. Cloud Run creates a new revision while Firestore keeps the
-availability and alert history.
+```powershell
+git pull --ff-only origin main
 
-If the Gmail app password is rotated, add a new version to the existing Secret
-Manager secret and change the deploy flag from `:1` to the new version, such as
-`:2`.
+.\scripts\deploy_cloud_run.ps1 `
+  -ProjectId $projectId `
+  -ServiceAccountEmail $serviceAccountEmail `
+  -SmtpUsername "sender@gmail.com" `
+  -AlertRecipient "recipient@gmail.com" `
+  -AdminApiKey $adminApiKey
+```
 
-Official references: [deploy Cloud Run from source](https://docs.cloud.google.com/run/docs/deploying-source-code),
+Cloud Run creates a new revision while Firestore keeps availability and alert
+history. If the Gmail app password is rotated, repeat the secret-version upload,
+find the new version number, and pass it during deployment:
+
+```powershell
+.\scripts\deploy_cloud_run.ps1 `
+  -ProjectId $projectId `
+  -ServiceAccountEmail $serviceAccountEmail `
+  -SmtpUsername "sender@gmail.com" `
+  -AlertRecipient "recipient@gmail.com" `
+  -AdminApiKey $adminApiKey `
+  -GmailSecretVersion "2"
+```
+
+Official references: [install Google Cloud CLI](https://docs.cloud.google.com/sdk/docs/install-sdk),
+[deploy Cloud Run from source](https://docs.cloud.google.com/run/docs/deploying-source-code),
 [create a Firestore database](https://docs.cloud.google.com/firestore/native/docs/manage-databases),
-[grant Secret Manager access](https://docs.cloud.google.com/secret-manager/docs/manage-access-to-secrets),
-and [Google app passwords](https://support.google.com/accounts/answer/185833).
+and [add a Secret Manager version](https://docs.cloud.google.com/secret-manager/docs/add-secret-version).
 
 ## Optional local development
 
@@ -266,8 +338,8 @@ Copy-Item .env.example .env
 ```
 
 Edit `.env`, authenticate Application Default Credentials to a test Firestore
-project, and start the service with `uvicorn app.main:app --reload --port 8080`.
-Run the test suite with `pytest -q`.
+project with `gcloud auth application-default login`, and start the service with
+`uvicorn app.main:app --reload --port 8080`. Run the tests with `pytest -q`.
 
 ## API
 
